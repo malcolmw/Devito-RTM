@@ -1,2 +1,2 @@
-# devito-RTM
+# Devito-RTM
 Reverse-time migration scripts for detecting/locating earthquakes using Devito.
