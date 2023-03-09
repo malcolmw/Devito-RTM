@@ -174,9 +174,9 @@ class PointSource(SparseTimeFunction):
         return PointSource(name=self.name, grid=self.grid, data=new_traces,
                            time_range=new_time_range, coordinates=self.coordinates.data)
 
-    # Pickling support
-    _pickle_kwargs = SparseTimeFunction._pickle_kwargs + ['time_range']
-    _pickle_kwargs.remove('nt')  # `nt` is inferred from `time_range`
+    # # Pickling support
+    # _pickle_kwargs = SparseTimeFunction._pickle_rkwargs + ['time_range']
+    # _pickle_kwargs.remove('nt')  # `nt` is inferred from `time_range`
 
 
 Receiver = PointSource
@@ -247,7 +247,7 @@ class WaveletSource(PointSource):
         plt.show()
 
     # Pickling support
-    _pickle_kwargs = PointSource._pickle_kwargs + ['f0', 'a', 'f0']
+    # _pickle_kwargs = PointSource._pickle_kwargs + ['f0', 'a', 'f0']
 
 
 class RickerSource(WaveletSource):
