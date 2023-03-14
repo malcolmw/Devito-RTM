@@ -9,53 +9,54 @@ Created on Mon Feb 20 10:46:10 2023
 
 import devito
 import devito_rtm
-import h5py
+import hdf5eis
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
+import pathlib
 
 compiler = devito.configuration["compiler"]
 compiler.cc = compiler.CC = "/usr/bin/gcc-10"
 compiler.cxx = compiler.CXX = "/usr/bin/g++-10"
 
-STATIONS = [
-    ('ZG', 'R0101'),
-    ('ZG', 'R0901'),
-    ('ZG', 'R0318'),
-    ('ZG', 'R1618'),
-    ('ZG', 'R2010'),
-    ('ZG', 'R2001')
-]
+PRECISION = np.float64
 
 def main():
     config = parse_config()
-    network = load_network()
     model = build_model(config)
-    wfs = load_wfs(STATIONS, network)
+    wfs = load_wfs(config['data']['waveform_path'])
+    wfs = wfs[::256]
 
-    Ws, kernels = build_wavefield_kernels(model, wfs)
+    Ws, kernels = build_wavefield_kernels(model, wfs, config)
     image, op = build_imaging_operator(model, Ws, kernels)
+    print('Starting RTM...')
     op(dt=model.critical_dt)
+    print('RTM complete.')
     
-    return image, op, network.loc[STATIONS]
+    return image, op, wfs
     
     
 def parse_config():
     config = dict(
         domain=dict(
-            shape=(101, 116, 40),    # Number of grid points (nx, ny, nz).
-            spacing=(10., 10., 10.), # Grid spacing in m (dx, dy, dz).
-            origin=(3710596.003824387, 537368.3199534912, -1584.6),     # Location of the top-left corner.
+            shape=(73, 79, 98),    # Number of grid points (nx, ny, nz).
+            spacing=(25., 25., 25.), # Grid spacing in m (dx, dy, dz).
+            origin=(3710196.0, 536968.3, -443.15314),     # Location of the top-left corner.
             nbl=20,                  # Number of absorbing boundary layers.
             bcs='damp',              # Absorbing boundary type.
-            space_order=2            # Space order of the finite difference stencil.
+            space_order=8,           # Space order of the finite difference stencil.
+            time_order=2
+        ),
+        data=dict(
+            waveform_path=pathlib.Path(
+                '/home/malcolmw/git/devito-RTM/data/test.hdf5'
+            )
         )
     )
     return config
 
 
 def build_model(config):
-    vp = np.ones(config['domain']['shape'])
+    vp = 4000*np.ones(config['domain']['shape'])
     return devito_rtm.model.SeismicModel(
         vp=vp,
         **{
@@ -67,16 +68,17 @@ def build_model(config):
         )
 
 def build_imaging_operator(model, Ws, kernels):
-    image = devito.Function(name='Im', grid=model.grid, dtype=np.float64)
+    image = devito.Function(name='Im', grid=model.grid, dtype=PRECISION)
     imaging_kernel = devito.Eq(image, (image + np.prod(Ws)))
     op = devito.Operator(
         [eq for kernel in kernels for eq in kernel] + [imaging_kernel], 
-        subs=model.spacing_map
+        subs=model.spacing_map,
+        opt=('advanced', {'openmp': True})
     )
     return image, op
 
 
-def build_wavefield_kernels(model, wfs):
+def build_wavefield_kernels(model, wfs, config):
     '''
     Build the computational kernels to extrapolate the reverse time-migrated
     wavefield at each station location.
@@ -98,28 +100,28 @@ def build_wavefield_kernels(model, wfs):
 
     '''
 
-    Ws = list() # Reverse time-migrated wavefields for each station.
+    Ws = list() # Reverse-time migrated wavefields for each station.
     kernels = list() # Computational kernel for each wavefield extrapolation.
-    for wf in wfs:
+    for i_wf, wf in enumerate(wfs):
         W = devito.TimeFunction(
-            name=f'W_{wf.seed_id}',
+            name=f'W_{i_wf:04d}',
             grid=model.grid,
-            time_order=2,
-            space_order=2,
-            dtype=np.float64
+            time_order=config['domain']['time_order'],
+            space_order=config['domain']['space_order'],
+            dtype=PRECISION
         )
         Ws.append(W)
         pde = model.m * W.dt2 - W.laplace + model.damp * W.dt
         stencil = devito.Eq(W.forward, devito.solve(pde, W.forward))
         rsrc = devito_rtm.source.PointSource(
-            name=f'X_{wf.seed_id}',
+            name=f'X_{i_wf:04d}',
             grid=model.grid,
             time_range=wf.time_range,
             npoint=1,
             coordinates=wf.coords,
-            space_order=2,
-            time_order=2,
-            dtype=np.float64
+            space_order=config['domain']['space_order'],
+            time_order=config['domain']['time_order'],
+            dtype=PRECISION
         )
         rsrc.data[:] = wf.data[-1::-1, np.newaxis]
         rsrc_term = rsrc.inject(
@@ -132,14 +134,7 @@ def build_wavefield_kernels(model, wfs):
     return Ws, kernels
 
 
-def load_network():
-    network = pd.read_hdf('../data/test_wfs.hdf5', key='/stations')
-    network = network.set_index(['network', 'station'])
-    network = network.sort_index()
-    return network
-
-
-def load_wfs(stations, network):
+def load_wfs(path):
     '''
     Return waveforms as a dictionary of {station: waveform} pairs.
 
@@ -154,37 +149,31 @@ def load_wfs(stations, network):
         DESCRIPTION.
 
     '''
-    path = '../data/test_wfs.hdf5'
-    meta = pd.read_hdf(path, key='/metadata')
-    meta = meta.set_index(['network', 'station'])
-    meta['index'] = np.arange(len(meta))
-    meta = meta.sort_index()
-    meta = meta.loc[stations]
-    meta = meta.reset_index()
-    
+
+    with hdf5eis.File(path, mode='r') as in_file:
+        network, _ = in_file.metadata['network']
+        network = network.drop_duplicates(subset=['network', 'station'])
+        super_gather = in_file.timeseries['synthetic', ..., 0:0.75e9]
+        gather = super_gather['synthetic'][0]
+    network = network.reset_index(drop=True)
     wfs = list()
     
-    with h5py.File(path, mode='r') as in_file:
-        for _, row in meta.iterrows():
-            network_code, station_code = row[['network', 'station']].values
-            data = in_file['/wfs'][row['index']]
-            time_range = devito_rtm.source.TimeAxis(
-                start=row['start_time'].timestamp(),
-                step=1/row['sampling_rate'],
-                num=len(data)
-            )
-            coords = network.loc[
-                (network_code, station_code), 
-                ['easting', 'northing', 'z']
-            ].values
-            channel_code = 'DPZ' if network_code == 'ZG' else 'HHZ'
-            seed_id = '_'.join((network_code, station_code, '', channel_code))
-            wfs.append(Waveform(
-                seed_id,
-                data,
-                time_range,
-                coords
-            ))
+    for (i, row), data in zip(network.iterrows(), gather.data):
+        time_range = devito_rtm.source.TimeAxis(
+            start=gather.start_time.timestamp(),
+            step=gather.sampling_interval,
+            num=len(data)
+        )
+        network_code, station_code, channel_code = row[['network', 'station', 'channel']]
+        coords = row[['easting', 'northing', 'z']].values
+        channel_code = 'DPZ' if network_code == 'ZG' else 'HHZ'
+        seed_id = '.'.join((network_code, station_code, '', channel_code))
+        wfs.append(Waveform(
+            seed_id,
+            data,
+            time_range,
+            coords
+        ))
 
     return wfs
 
@@ -192,98 +181,107 @@ def load_wfs(stations, network):
 class Waveform:
     def __init__(self, seed_id, data, time_range, coords):
         self.seed_id = seed_id
-        self.data = data + 0.05*np.random.randn(len(data))
+        self.data = data
         self.time_range = time_range
         self.coords = coords
         
         
-def plot_field(field, network):
-    ix, iy, iz = np.unravel_index(
-        np.argmax(np.abs(field.data)), 
-        field.data.shape
-    )
+def plot_field(field, src_coords=None, it=None, z_positive_down=False):
+    import matplotlib as mpl
     x0, y0, z0 = field.grid.origin
     nx, ny, nz = field.grid.shape
     dx, dy, dz = field.grid.spacing
-    
     xx, yy, zz = np.meshgrid(
         x0 + np.arange(nx)*dx,
         y0 + np.arange(ny)*dy,
         z0 + np.arange(nz)*dz,
         indexing='ij'
     )
-    
-    fig = plt.figure()
-    ax_xy = fig.add_subplot(2, 2, 1, anchor='E')
-    ax_yz = fig.add_subplot(2, 2, 2, sharey=ax_xy, anchor='W')
-    ax_xz = fig.add_subplot(2, 2, 3, sharex=ax_xy, anchor='NE')
-    plt.subplots_adjust(wspace=0, hspace=0)
 
-    ax_yz.set_xticklabels([])    
-    ax_yz.set_yticklabels([])
-    ax_xy.set_xticklabels([])
-    ax_xz.set_yticklabels([])
+    arg_max = np.argmax(np.abs(field.data))
+    ix, iy, iz = np.unravel_index(arg_max, field.data.shape)
+    img_max = np.array([x0+(ix-1)*dx, y0+(iy-1)*dy, z0+(iz-1)*dz])
 
-    cmap = plt.get_cmap('seismic')
-    amax = np.max(np.abs(field.data))
-    color = 'k'
-    linewidth = 1/2
-    shading = 'nearest'
-    ax_yz.pcolormesh(
-        zz[ix], 
-        yy[ix], 
-        field.data[ix], 
-        shading=shading,
-        cmap=cmap,
+    data = field.data if it is None else field.data[it]
+
+    x_range = dx*(nx-1)
+    y_range = dy*(ny-1)
+    z_range = dz*(nz-1)
+    w = [x_range/(x_range+z_range), z_range/(x_range+z_range)]
+    h = [y_range/(y_range+z_range), z_range/(y_range+z_range)]
+    gs = mpl.gridspec.GridSpec(2, 2, width_ratios=w, height_ratios=h)
+    fig = plt.figure(figsize=(12,12))
+    ax_xy = fig.add_subplot(gs[0, 0], aspect=1, anchor='SE')
+    ax_yz = fig.add_subplot(gs[0, 1], aspect=1, sharey=ax_xy, anchor='SW')
+    ax_xz = fig.add_subplot(gs[1, 0], aspect=1, sharex=ax_xy, anchor='NE')
+    plt.subplots_adjust(hspace=0, wspace=0)
+
+
+    amax = np.max(np.abs(data))
+    kwargs = dict(
         vmin=-amax,
-        vmax=amax
+        vmax=amax,
+        cmap=plt.get_cmap('seismic'),
+        shading='gouraud'
     )
-    ax_yz.axvline(zz[0, 0, iz], color=color, linewidth=linewidth)
-    ax_yz.axhline(yy[0, iy, 0], color=color, linewidth=linewidth)
-    
-    ax_xz.pcolormesh(
-        xx[:, iy], 
-        zz[:, iy], 
-        field.data[:, iy],
-        shading=shading,
-        cmap=cmap,
-        vmin=-amax,
-        vmax=amax
-    )
-    ax_xz.axvline(xx[ix, 0, 0], color=color, linewidth=linewidth)
-    ax_xz.axhline(zz[0, 0, iz], color=color, linewidth=linewidth)
-    
     ax_xy.pcolormesh(
-        xx[:, :, iz], 
-        yy[:, :, iz], 
-        field.data[:, :, iz], 
-        shading=shading,
-        cmap=cmap,
-        vmin=-amax,
-        vmax=amax
+        xx[:, :, iz],
+        yy[:, :, iz],
+        data[:, :, iz],
+        **kwargs
     )
-    ax_xy.axvline(xx[ix, 0, 0], color=color, linewidth=linewidth)
-    ax_xy.axhline(yy[0, iy, 0], color=color, linewidth=linewidth)
+    ax_xz.pcolormesh(
+        xx[:, iy],
+        zz[:, iy],
+        data[:, iy],
+        **kwargs
+    )
+    ax_yz.pcolormesh(
+        zz[ix],
+        yy[ix],
+        data[ix],
+        **kwargs
+    )
+    for ax, vline, hline in zip(
+        (ax_xy, ax_xz, ax_yz),
+        img_max[[0, 0, 2]],
+        img_max[[1, 2, 1]]
+    ):
+        ax.axvline(vline, color='k', linewidth=1/2)
+        ax.axhline(hline, color='k', linewidth=1/2)
+    if src_coords is not None:
+        for ax, x0, x1 in zip(
+            (ax_xy, ax_xz, ax_yz),
+            src_coords[[0, 0, 2]],
+            src_coords[[1, 2, 1]]
+        ):
+            ax.scatter(x0, x1)
+        
+    ax_xy.xaxis.tick_top()
+    ax_yz.xaxis.tick_top()
+    ax_yz.yaxis.tick_right()
+    if z_positive_down is True:
+        ax_xz.invert_yaxis()
+    else:
+        ax_yz.invert_xaxis()
 
-    x0, y0, z0 = 3710896.0, 537743.3125, -1589.5999755859375
-    color = 'C3'
-    linewidth = 1
-    ax_yz.axvline(z0, color=color, linewidth=linewidth)
-    ax_yz.axhline(y0, color=color, linewidth=linewidth)
-    ax_xy.axvline(x0, color=color, linewidth=linewidth)
-    ax_xy.axhline(y0, color=color, linewidth=linewidth)
-    ax_xz.axvline(x0, color=color, linewidth=linewidth)
-    ax_xz.axhline(z0, color=color, linewidth=linewidth)
-    
-    ax_xy.scatter(
-        network['easting'],
-        network['northing'],
-        marker='v',
-        zorder=100
+    return dict(
+        ax_xy=ax_xy,
+        ax_xz=ax_xz,
+        ax_yz=ax_yz
     )
+
+def plot(wf):
+    fig, ax = plt.subplots()
+    ax.plot(wf.data)
     
-    plt.show()
 
 if __name__ == '__main__':
-    image, op, network = main()
-    plot_field(image, network)
+    image, op, wfs = main()
+    axes = plot_field(
+        image, 
+        src_coords=np.array([3711108.5, 537955.82, 781.846871])
+    )
+    x = [wf.coords[0] for wf in wfs]
+    y = [wf.coords[1] for wf in wfs]
+    axes['ax_xy'].scatter(x, y)
