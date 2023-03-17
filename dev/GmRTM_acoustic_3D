@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pathlib
 
-compiler = devito.configuration["compiler"]
-compiler.cc = compiler.CC = "/usr/bin/gcc-10"
-compiler.cxx = compiler.CXX = "/usr/bin/g++-10"
+# compiler = devito.configuration["compiler"]
+# compiler.cc = compiler.CC = "/usr/bin/gcc-10"
+# compiler.cxx = compiler.CXX = "/usr/bin/g++-10"
 
 PRECISION = np.float64
 
@@ -24,7 +24,7 @@ def main():
     config = parse_config()
     model = build_model(config)
     wfs = load_wfs(config['data']['waveform_path'])
-    wfs = wfs[::256]
+    wfs = wfs[::128]
 
     Ws, kernels = build_wavefield_kernels(model, wfs, config)
     image, op = build_imaging_operator(model, Ws, kernels)
@@ -38,9 +38,9 @@ def main():
 def parse_config():
     config = dict(
         domain=dict(
-            shape=(73, 79, 98),    # Number of grid points (nx, ny, nz).
-            spacing=(25., 25., 25.), # Grid spacing in m (dx, dy, dz).
-            origin=(3710196.0, 536968.3, -443.15314),     # Location of the top-left corner.
+            shape=(210, 233, 157),      # Number of grid points (nx, ny, nz).
+            spacing=(6.25, 6.25, 6.25), # Grid spacing in m (dx, dy, dz).
+            origin=(3710446.0, 537218.3, 758.6823), # Location of the top-left corner.
             nbl=20,                  # Number of absorbing boundary layers.
             bcs='damp',              # Absorbing boundary type.
             space_order=8,           # Space order of the finite difference stencil.
@@ -48,7 +48,7 @@ def parse_config():
         ),
         data=dict(
             waveform_path=pathlib.Path(
-                '/home/malcolmw/git/devito-RTM/data/test.hdf5'
+                '/home/malcolmw/git/devito-RTM/data/test-8Hz.hdf5'
             )
         )
     )
@@ -56,7 +56,7 @@ def parse_config():
 
 
 def build_model(config):
-    vp = 4000*np.ones(config['domain']['shape'])
+    vp = 1000*np.ones(config['domain']['shape'])
     return devito_rtm.model.SeismicModel(
         vp=vp,
         **{
@@ -65,7 +65,7 @@ def build_model(config):
                 'shape', 'spacing', 'origin', 'nbl', 'bcs', 'space_order'
             )
         }
-        )
+    )
 
 def build_imaging_operator(model, Ws, kernels):
     image = devito.Function(name='Im', grid=model.grid, dtype=PRECISION)
@@ -150,11 +150,12 @@ def load_wfs(path):
 
     '''
 
+    tag = 'synthetic/raw'
     with hdf5eis.File(path, mode='r') as in_file:
         network, _ = in_file.metadata['network']
         network = network.drop_duplicates(subset=['network', 'station'])
-        super_gather = in_file.timeseries['synthetic', ..., 0:0.75e9]
-        gather = super_gather['synthetic'][0]
+        super_gather = in_file.timeseries[tag, ..., 0:0.4e9]
+        gather = super_gather['synthetic/raw'][0]
     network = network.reset_index(drop=True)
     wfs = list()
     
@@ -184,6 +185,10 @@ class Waveform:
         self.data = data
         self.time_range = time_range
         self.coords = coords
+        
+    def plot(self):
+        fig, ax = plt.subplots()
+        ax.plot(self.data)
         
         
 def plot_field(field, src_coords=None, it=None, z_positive_down=False):
@@ -280,7 +285,7 @@ if __name__ == '__main__':
     image, op, wfs = main()
     axes = plot_field(
         image, 
-        src_coords=np.array([3711108.5, 537955.82, 781.846871])
+        src_coords=np.array([3711102.253824387, 537946.4449534912, 1249.3072903108782])
     )
     x = [wf.coords[0] for wf in wfs]
     y = [wf.coords[1] for wf in wfs]

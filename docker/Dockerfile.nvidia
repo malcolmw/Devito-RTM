@@ -1,0 +1,10 @@
+FROM devitocodes/devito:nvidia-nvc-latest
+
+USER root
+RUN /venv/bin/pip install --no-cache-dir hdf5eis tables && \
+    rm -rf ~/.cache/pip
+
+USER app
+WORKDIR /
+
+CMD jupyter lab --no-browser --ip='*'
